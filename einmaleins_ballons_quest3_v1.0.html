@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<!--
+  Programm:  Einmaleins-Ballons Quest 3 (WebXR)
+  Version:   v1.0
+  Datum:     2026-10-01
+  Basis:     Einmaleins-Ballons v1.2 (Desktop/Touch)
+  Beschreibung:
+    Lernspiel für das kleine 1x1 für die Meta Quest 3 (Meta Browser, WebXR).
+    - Aufgabe schwebt oben im Raum, Ballons mit Lösungen steigen vor dir auf
+    - Mit dem Controller zielen, Trigger = Ballon platzen lassen
+    - Richtig = +1, falsch = -1
+    - Level: alle 4 richtigen Antworten -> schneller + schwerere Reihen
+    - Modi: AR (Passthrough, Ballons im echten Raum), VR, Desktop-Vorschau
+    - Faktoren 1-10, Ergebnisse max. 100
+  Technik: Three.js r160 (CDN), WebXR local-floor, Controller-Raycasting, Haptik
+-->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Einmaleins-Ballons Quest 3 v1.0</title>
+<style>
+  html,body { margin:0; height:100%; overflow:hidden; background:#7ec8ff; font-family:system-ui,Arial,sans-serif; }
+  canvas { display:block; }
+  #overlay {
+    position:fixed; inset:0; z-index:10; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:18px; padding:24px; text-align:center;
+    background:linear-gradient(#7ec8ff,#d9f1ff); color:#234;
+  }
+  #overlay h1 { margin:0; font-size:clamp(30px,6vw,56px); }
+  #overlay p { margin:0; font-size:clamp(16px,2.4vw,22px); max-width:640px; }
+  .btn {
+    font-size:clamp(20px,3vw,28px); font-weight:700; padding:16px 34px; border:0; border-radius:16px;
+    background:#1e88e5; color:#fff; cursor:pointer; min-width:300px;
+    box-shadow:0 4px 12px rgba(0,0,0,.25);
+  }
+  .btn.vr { background:#8e24aa; }
+  .btn.pre { background:#43a047; }
+  .btn:disabled { background:#9aa; cursor:not-allowed; opacity:.7; }
+  #status { font-size:16px; opacity:.8; min-height:1.3em; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="overlay">
+  <h1>🎈 Einmaleins-Ballons</h1>
+  <p>Zielen mit dem Controller, Trigger drücken. Richtiger Ballon = +1, falscher = −1.</p>
+  <button class="btn" id="btnAR" disabled>AR starten (Passthrough)</button>
+  <button class="btn vr" id="btnVR" disabled>VR starten</button>
+  <button class="btn pre" id="btnPre">Desktop-Vorschau</button>
+  <div id="status">Prüfe WebXR …</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+const VERSION = "v1.0";
+document.title = `Einmaleins-Ballons Quest 3 ${VERSION}`;
+
+/* ---------------- Konfiguration ---------------- */
+const RANGES = [[1,5],[2,7],[3,8],[4,10],[6,10],[7,10]];  // Faktorbereiche je Level
+const CORRECT_PER_LEVEL = 4;
+const SPEED_STEP = 0.15;
+const SPEED_MAX = 2.5;
+const BALLOON_Z = -2.0;          // Abstand vor dem Spieler (Meter)
+const X_SPAN = 1.25;             // Ballons verteilen sich auf +/- X_SPAN
+const Y_START = 0.35;
+const Y_END = 2.55;
+const COLORS = [0xe53935,0x8e24aa,0x1e88e5,0x43a047,0xfb8c00,0xd81b60,0x00acc1];
+
+/* ---------------- Three.js Grundaufbau ---------------- */
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.setClearColor(0x7ec8ff, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, 0.8);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(1, 3, 2);
+scene.add(sun);
+
+// Boden nur in VR / Vorschau sichtbar (in AR bleibt der echte Raum)
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(8, 48).rotateX(-Math.PI/2),
+  new THREE.MeshStandardMaterial({ color:0x6fbf73, roughness:1 })
+);
+scene.add(ground);
+
+/* ---------------- Audio ---------------- */
+let audioCtx = null;
+function beep(freq, dur, type='sine', vol=.15) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(.001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+/* ---------------- Spielzustand ---------------- */
+let score = 0, streak = 0, best = 0, correctCount = 0, level = 1;
+let correct = 0, taskText = '? × ?';
+let balloons = [];
+let roundOver = false;
+let running = false;
+let lastA = 0, lastB = 0;
+let panelMsg = '', panelMsgT = 0;
+let flashColor = null, flashT = 0;
+
+const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const speedFactor = () => Math.min(SPEED_MAX, 1 + SPEED_STEP * (level - 1));
+
+/* ---------------- Aufgaben-Tafel ---------------- */
+const panelCanvas = document.createElement('canvas');
+panelCanvas.width = 1024; panelCanvas.height = 512;
+const pctx = panelCanvas.getContext('2d');
+const panelTex = new THREE.CanvasTexture(panelCanvas);
+panelTex.colorSpace = THREE.SRGBColorSpace;
+const panel = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.8, 0.9),
+  new THREE.MeshBasicMaterial({ map:panelTex, transparent:true })
+);
+panel.position.set(0, 3.0, -2.4);
+panel.rotation.x = 0.45;
+scene.add(panel);
+
+function drawPanel() {
+  const c = pctx, W = panelCanvas.width, H = panelCanvas.height;
+  c.clearRect(0, 0, W, H);
+  c.fillStyle = 'rgba(255,255,255,0.93)';
+  c.beginPath(); c.roundRect(8, 8, W-16, H-16, 48); c.fill();
+  if (flashColor && flashT > 0) {
+    c.lineWidth = 22; c.strokeStyle = flashColor;
+    c.beginPath(); c.roundRect(14, 14, W-28, H-28, 44); c.stroke();
+  }
+  c.fillStyle = '#223344';
+  c.textBaseline = 'middle';
+  if (panelMsg && panelMsgT > 0) {
+    c.textAlign = 'center';
+    c.font = '800 150px system-ui, Arial';
+    c.fillStyle = '#ff6f00';
+    c.fillText(panelMsg, W/2, H/2);
+  } else {
+    c.textAlign = 'left';
+    c.font = '800 190px system-ui, Arial';
+    c.fillText(taskText, 50, H/2 + 6);
+    c.textAlign = 'right';
+    c.font = '800 110px system-ui, Arial';
+    c.fillText(String(score), W-60, 150);
+    c.font = '600 46px system-ui, Arial';
+    c.fillStyle = '#556677';
+    c.fillText('Punkte', W-60, 232);
+    c.font = '700 54px system-ui, Arial';
+    c.fillStyle = '#223344';
+    c.fillText(`Level ${level}`, W-60, 328);
+    c.font = '600 44px system-ui, Arial';
+    c.fillStyle = '#556677';
+    c.fillText(streak >= 2 ? `🔥 ${streak} in Folge` : (best ? `Beste Serie: ${best}` : ''), W-60, 400);
+  }
+  panelTex.needsUpdate = true;
+}
+
+/* ---------------- Ballon-Bausteine ---------------- */
+const geoBody = new THREE.SphereGeometry(0.24, 32, 24);
+const geoKnot = new THREE.ConeGeometry(0.035, 0.07, 12);
+const geoString = new THREE.CylinderGeometry(0.004, 0.004, 0.6, 6);
+const geoLabel = new THREE.PlaneGeometry(0.3, 0.3);
+const labelCache = new Map();
+
+function labelTexture(val) {
+  if (labelCache.has(val)) return labelCache.get(val);
+  const cv = document.createElement('canvas'); cv.width = cv.height = 256;
+  const c = cv.getContext('2d');
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = '900 150px system-ui, Arial';
+  c.lineWidth = 16; c.strokeStyle = 'rgba(0,0,0,.45)'; c.lineJoin = 'round';
+  c.strokeText(String(val), 128, 132);
+  c.fillStyle = '#fff';
+  c.fillText(String(val), 128, 132);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  labelCache.set(val, t);
+  return t;
+}
+
+function makeBalloon(val, x, delay) {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({
+    color: COLORS[rnd(0, COLORS.length-1)], roughness: .3, metalness: 0, transparent: true
+  });
+  const body = new THREE.Mesh(geoBody, mat);
+  body.scale.set(.9, 1.1, .9);
+  const knot = new THREE.Mesh(geoKnot, mat);
+  knot.position.y = -.27; knot.rotation.x = Math.PI;
+  const str = new THREE.Mesh(geoString, new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:.75 }));
+  str.position.y = -.6;
+  const lmat = new THREE.MeshBasicMaterial({ map:labelTexture(val), transparent:true, depthWrite:false });
+  const label = new THREE.Mesh(geoLabel, lmat);
+  label.position.set(0, .02, .225);
+  g.add(body, knot, str, label);
+  g.visible = false;
+  scene.add(g);
+  return {
+    g, body, mat, lmat, strMat: str.material, val, x,
+    y: Y_START, z: BALLOON_Z + (Math.random()*.4 - .2),
+    speed: (0.20 + Math.random()*0.12) * speedFactor(),
+    phase: Math.random() * 6.28, sway: .04 + Math.random()*.06,
+    delay, age: 0, popping: false, popT: 0, hover: false
+  };
+}
+
+function removeBalloon(b) {
+  scene.remove(b.g);
+  b.mat.dispose(); b.lmat.dispose(); b.strMat.dispose();
+}
+
+/* ---------------- Runden ---------------- */
+function pickFactors() {
+  const [lo, hi] = RANGES[Math.min(level, RANGES.length) - 1];
+  let a, b, tries = 0;
+  do { a = rnd(lo, hi); b = rnd(lo, hi); tries++; } while (a === lastA && b === lastB && tries < 10);
+  lastA = a; lastB = b;
+  return [a, b];
+}
+
+function newRound() {
+  balloons.forEach(removeBalloon);
+  balloons = [];
+  roundOver = false;
+
+  const [a, b] = pickFactors();
+  correct = a * b;
+  taskText = `${a} × ${b} =`;
+  drawPanel();
+
+  const answers = new Set([correct]);
+  const cand = [a*(b+1), a*(b-1), (a+1)*b, (a-1)*b, correct+rnd(1,3), correct-rnd(1,3), correct+10, correct-10, a+b];
+  for (let i = cand.length-1; i > 0; i--) { const j = rnd(0, i); [cand[i], cand[j]] = [cand[j], cand[i]]; }
+  for (const c of cand) {
+    if (answers.size >= 5) break;
+    if (c > 0 && c <= 100 && !answers.has(c)) answers.add(c);
+  }
+  while (answers.size < 5) answers.add(rnd(2, 100));
+
+  const list = [...answers].sort(() => Math.random() - .5);
+  const slots = [0,1,2,3,4].sort(() => Math.random() - .5);
+  list.forEach((val, i) => {
+    const x = -X_SPAN + slots[i] * (2*X_SPAN/4) + (Math.random()*.1 - .05);
+    balloons.push(makeBalloon(val, x, i * 0.35 + Math.random()*0.3));
+  });
+}
+
+function setScore(d) {
+  score += d;
+  if (d > 0) { streak++; best = Math.max(best, streak); } else { streak = 0; }
+  drawPanel();
+}
+
+/* ---------------- Effekte ---------------- */
+const floaters = [];
+function floatText(txt, pos, color) {
+  const cv = document.createElement('canvas'); cv.width = 256; cv.height = 128;
+  const c = cv.getContext('2d');
+  c.font = '900 110px system-ui, Arial'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.lineWidth = 14; c.strokeStyle = 'rgba(0,0,0,.4)'; c.lineJoin = 'round';
+  c.strokeText(txt, 128, 68);
+  c.fillStyle = color; c.fillText(txt, 128, 68);
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map:tex, transparent:true, depthTest:false });
+  const sp = new THREE.Sprite(mat);
+  sp.scale.set(.6, .3, 1); sp.position.copy(pos); sp.renderOrder = 10;
+  scene.add(sp);
+  floaters.push({ sp, mat, tex, t:0 });
+}
+
+function haptic(source, strength, ms) {
+  try {
+    const gp = source && source.gamepad;
+    if (!gp) return;
+    if (gp.hapticActuators && gp.hapticActuators[0]) gp.hapticActuators[0].pulse(strength, ms);
+    else if (gp.vibrationActuator) gp.vibrationActuator.playEffect('dual-rumble', { duration:ms, strongMagnitude:strength, weakMagnitude:strength });
+  } catch(e) {}
+}
+
+/* ---------------- Treffer ---------------- */
+function hitBalloon(b, inputSource) {
+  if (b.popping) return;
+  b.popping = true; b.popT = 0;
+  const pos = b.g.position.clone(); pos.y += .1;
+  if (b.val === correct) {
+    correctCount++;
+    setScore(+1);
+    beep(660, .12); setTimeout(() => beep(880, .15), 90);
+    floatText('+1', pos, '#2ee05a');
+    flashColor = '#43a047'; flashT = .5;
+    haptic(inputSource, .8, 80);
+    if (correctCount % CORRECT_PER_LEVEL === 0) {
+      level++;
+      panelMsg = `Level ${level}!`; panelMsgT = 1.3;
+      setTimeout(() => beep(523, .12), 150);
+      setTimeout(() => beep(659, .12), 270);
+      setTimeout(() => beep(784, .2), 390);
+      drawPanel();
+    }
+    roundOver = true;
+    setTimeout(newRound, 600);
+  } else {
+    setScore(-1);
+    beep(180, .25, 'sawtooth');
+    floatText('−1', pos, '#ff5252');
+    flashColor = '#d32f2f'; flashT = .5;
+    haptic(inputSource, 1.0, 160);
+  }
+}
+
+/* ---------------- Controller ---------------- */
+const raycaster = new THREE.Raycaster();
+const tmpM = new THREE.Matrix4();
+const controllers = [];
+const factory = new XRControllerModelFactory();
+
+function candidates() {
+  return balloons.filter(b => b.delay <= 0 && !b.popping).map(b => b.body);
+}
+function balloonOfBody(body) { return balloons.find(b => b.body === body); }
+
+for (let i = 0; i < 2; i++) {
+  const ctrl = renderer.xr.getController(i);
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-1)]),
+    new THREE.LineBasicMaterial({ color:0xffffff })
+  );
+  line.scale.z = 3;
+  ctrl.add(line);
+  ctrl.userData.line = line;
+  ctrl.addEventListener('connected', e => { ctrl.userData.source = e.data; });
+  ctrl.addEventListener('selectstart', () => {
+    if (!running) return;
+    const hit = rayHit(ctrl);
+    if (hit) hitBalloon(balloonOfBody(hit.object), ctrl.userData.source);
+  });
+  scene.add(ctrl);
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(factory.createControllerModel(grip));
+  scene.add(grip);
+  controllers.push(ctrl);
+}
+
+function rayHit(ctrl) {
+  tmpM.identity().extractRotation(ctrl.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpM);
+  const hits = raycaster.intersectObjects(candidates(), false);
+  return hits[0] || null;
+}
+
+/* ---------------- Desktop-Vorschau (Maus) ---------------- */
+const mouse = new THREE.Vector2();
+renderer.domElement.addEventListener('pointerdown', ev => {
+  if (!running || renderer.xr.isPresenting) return;
+  mouse.set(ev.clientX / innerWidth * 2 - 1, -(ev.clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(mouse, camera);
+  const hit = raycaster.intersectObjects(candidates(), false)[0];
+  if (hit) hitBalloon(balloonOfBody(hit.object), null);
+});
+
+/* ---------------- Hauptschleife ---------------- */
+const clock = new THREE.Clock();
+const camPos = new THREE.Vector3();
+const hoverTarget = new Set();
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(.05, clock.getDelta());
+  if (!running) { renderer.render(scene, camera); return; }
+
+  camera.getWorldPosition(camPos);
+
+  // Panel-Effekte
+  if (flashT > 0) { flashT -= dt; if (flashT <= 0) { flashColor = null; } drawPanel(); }
+  if (panelMsgT > 0) { panelMsgT -= dt; if (panelMsgT <= 0) { panelMsg = ''; drawPanel(); } }
+
+  // Ballons
+  for (const b of balloons.slice()) {
+    if (b.delay > 0) { b.delay -= dt; if (b.delay > 0) continue; b.g.visible = true; }
+    b.age += dt;
+    if (b.popping) {
+      b.popT += dt;
+    } else {
+      b.y += b.speed * dt;
+      b.phase += dt * 1.5;
+    }
+    const grow = Math.min(1, b.age / .5);
+    const s = b.popping ? 1 + b.popT * 3 : grow;
+    b.g.scale.setScalar(Math.max(.001, s));
+    b.g.position.set(b.x + Math.sin(b.phase) * b.sway, b.y, b.z);
+    b.g.rotation.y = Math.atan2(camPos.x - b.g.position.x, camPos.z - b.g.position.z);
+    if (b.popping) {
+      const o = Math.max(0, 1 - b.popT / .25);
+      b.mat.opacity = o; b.lmat.opacity = o; b.strMat.opacity = o * .75;
+      if (b.popT >= .25) { removeBalloon(b); balloons.splice(balloons.indexOf(b), 1); }
+    } else if (b.y > Y_END) {
+      removeBalloon(b); balloons.splice(balloons.indexOf(b), 1);
+    }
+  }
+
+  // richtiger Ballon entkommen / weg -> neue Runde
+  if (!roundOver && balloons.every(b => b.delay <= 0 || true)) {
+    if (!balloons.some(b => b.val === correct)) {
+      roundOver = true; setTimeout(newRound, 400);
+    }
+  }
+
+  // Hover-Highlight + Strahllänge
+  hoverTarget.clear();
+  if (renderer.xr.isPresenting) {
+    for (const ctrl of controllers) {
+      if (!ctrl.visible) continue;
+      const hit = rayHit(ctrl);
+      ctrl.userData.line.scale.z = hit ? hit.distance : 3;
+      if (hit) hoverTarget.add(hit.object);
+    }
+  }
+  for (const b of balloons) b.mat.emissive.setHex(hoverTarget.has(b.body) ? 0x444444 : 0x000000);
+
+  // Schwebende Texte
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.t += dt;
+    f.sp.position.y += dt * .6;
+    f.mat.opacity = Math.max(0, 1 - f.t / .9);
+    if (f.t >= .9) { scene.remove(f.sp); f.mat.dispose(); f.tex.dispose(); floaters.splice(i, 1); }
+  }
+
+  renderer.render(scene, camera);
+});
+
+/* ---------------- Start / Ende ---------------- */
+const overlay = document.getElementById('overlay');
+const btnAR = document.getElementById('btnAR');
+const btnVR = document.getElementById('btnVR');
+const btnPre = document.getElementById('btnPre');
+const statusEl = document.getElementById('status');
+
+function resetGame() {
+  score = 0; streak = 0; best = 0; correctCount = 0; level = 1;
+  panelMsg = ''; panelMsgT = 0; flashColor = null; flashT = 0;
+  balloons.forEach(removeBalloon); balloons = [];
+  newRound();
+}
+
+function startGame(mode) {
+  running = true;
+  overlay.style.display = 'none';
+  const ar = mode === 'ar';
+  ground.visible = !ar;
+  renderer.setClearColor(0x7ec8ff, ar ? 0 : 1);
+  scene.background = null;
+  resetGame();
+  beep(440, .08, 'sine', .001);   // AudioContext freischalten
+}
+
+async function startXR(mode) {
+  try {
+    const session = await navigator.xr.requestSession(
+      mode === 'ar' ? 'immersive-ar' : 'immersive-vr',
+      { requiredFeatures:['local-floor'] }
+    );
+    session.addEventListener('end', () => {
+      running = false;
+      overlay.style.display = 'flex';
+      ground.visible = true;
+      renderer.setClearColor(0x7ec8ff, 1);
+    });
+    await renderer.xr.setSession(session);
+    startGame(mode);
+  } catch (e) {
+    statusEl.textContent = 'Start fehlgeschlagen: ' + e.message;
+  }
+}
+
+btnAR.onclick = () => startXR('ar');
+btnVR.onclick = () => startXR('vr');
+btnPre.onclick = () => {
+  camera.position.set(0, 1.6, 0.8);
+  camera.lookAt(0, 1.7, -2);
+  startGame('preview');
+};
+
+(async () => {
+  if (!navigator.xr) { statusEl.textContent = 'Kein WebXR verfügbar – nur Desktop-Vorschau (HTTPS nötig).'; return; }
+  const [ar, vr] = await Promise.all([
+    navigator.xr.isSessionSupported('immersive-ar').catch(() => false),
+    navigator.xr.isSessionSupported('immersive-vr').catch(() => false)
+  ]);
+  btnAR.disabled = !ar; btnVR.disabled = !vr;
+  statusEl.textContent = ar || vr ? `Bereit (${VERSION})` : 'Weder AR noch VR unterstützt – nur Desktop-Vorschau.';
+})();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+drawPanel();
+</script>
+</body>
+</html>
