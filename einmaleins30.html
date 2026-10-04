@@ -1,8 +1,11 @@
 <!DOCTYPE html>
 <!--
   Programm:  Einmaleins-Spielesammlung Quest 3 (WebXR)
-  Version:   v3.1
+  Version:   v3.2
   Datum:     2026-10-02
+  Änderungen gegenüber v3.1:
+    - Papa-Verwaltung (Button "Spiele sperren" im Hub von Papa): pro Spieler (Julia/Samu/Mama) einzelne Spiele
+      sperren und wieder freigeben. Gesperrte Spiele zeigen "von Papa gesperrt". Gespeichert im Spielstand des Spielers.
   Änderungen gegenüber v3.0:
     - Pro Tag wird höchstens EIN neues Spiel frei (auch wenn mehrere Punkte-Grenzen auf einmal erreicht sind).
       Weitere Spiele rücken in Tagesschritten nach. Alte Spielstände werden beim Laden entsprechend neu verteilt.
@@ -67,7 +70,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Einmaleins-Spielesammlung Quest 3 v3.1</title>
+<title>Einmaleins-Spielesammlung Quest 3 v3.2</title>
 <style>
   html,body { margin:0; height:100%; overflow:hidden; background:#7ec8ff; font-family:system-ui,Arial,sans-serif; }
   canvas { display:block; }
@@ -111,7 +114,7 @@
 import * as THREE from 'three';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
-const VERSION = "v3.1";
+const VERSION = "v3.2";
 document.title = `Einmaleins-Spielesammlung Quest 3 ${VERSION}`;
 const ALL_UNLOCKED = /[?&]alle\b/.test(location.search);
 
@@ -473,7 +476,8 @@ function createGameScreen(def) {
    ====================================================================== */
 // Spiel ist offen: Gratis-Spiel, oder Punkte-Grenze wurde an einem früheren Tag erreicht ("am nächsten Tag erst frei")
 const hasAll = () => ALL_UNLOCKED || (currentUser && currentUser.all);   // Papa darf immer alles
-const isUnlocked = g => hasAll() || g.unlock === 0 || (!!save.reached[g.id] && todayStr() > save.reached[g.id]);
+const isLocked = g => !hasAll() && !!(save.locked && save.locked[g.id]);   // von Papa gesperrt
+const isUnlocked = g => !isLocked(g) && (hasAll() || g.unlock === 0 || (!!save.reached[g.id] && todayStr() > save.reached[g.id]));
 // Höchstens ein neues Spiel pro Tag: erreichte Grenzen bekommen aufeinanderfolgende Tage (frei ab dem Tag danach)
 function assignReached() {
   const newly = [];
@@ -489,7 +493,7 @@ function assignReached() {
   return newly;
 }
 const freeLabel = g => { const f = addDays(save.reached[g.id], 1); return f === addDays(todayStr(), 1) ? 'morgen' : `am ${f.slice(8)}.${f.slice(5, 7)}.`; };
-const isWaiting  = g => !hasAll() && g.unlock > 0 && !!save.reached[g.id] && !isUnlocked(g);   // Punkte reicht, aber erst ab morgen
+const isWaiting  = g => !isLocked(g) && !hasAll() && g.unlock > 0 && !!save.reached[g.id] && !isUnlocked(g);   // Punkte reicht, aber erst ab morgen
 
 function createResultScreen(def, S, pts) {
   const R = makeScreen();
@@ -609,12 +613,63 @@ function createPinScreen(u) {
 }
 
 /* ======================================================================
+   Papa-Verwaltung: Spiele für andere Spieler sperren / wieder freigeben
+   ====================================================================== */
+function createAdminScreen(targetId) {
+  const A = makeScreen();
+  const others = USERS.filter(u => !u.all);
+  const tid = targetId || others[0].id;
+  const target = USERS.find(u => u.id === tid);
+  const tsave = readSave(tid);
+  if (!tsave.locked) tsave.locked = {};
+  const writeTarget = () => { memStore[tid] = tsave; try { localStorage.setItem(SAVE_PREFIX + tid, JSON.stringify(tsave)); } catch (e) {} };
+
+  const title = canvasMesh(1.6, .42, 960, 250, (c, W, H) => {
+    rrect(c, 6, 6, W-12, H-12, 40, 'rgba(255,255,255,.95)');
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillStyle = '#223344'; c.font = '800 72px system-ui, Arial'; c.fillText('🔧 Spiele sperren', W/2, 95);
+    c.fillStyle = '#556677'; const t2 = `${target.icon} ${target.name}: Spiel antippen = sperren / frei`; fitText(c, t2, W - 80, 46, '600'); c.fillText(t2, W/2, 180);
+  });
+  title.mesh.position.set(0, 2.6, -1.7); A.add(title.mesh);
+
+  others.forEach((u, i) => {
+    const on = u.id === tid;
+    const b = makeButton(`${u.icon} ${u.name}`, .5, .2, on ? '#1e88e5' : '#78909c', () => { if (!on) go(() => createAdminScreen(u.id)); });
+    b.mesh.position.set((i - (others.length - 1) / 2) * .56, 2.22, -1.7); A.add(b.mesh); A.addInter(b.mesh);
+  });
+
+  GAMES.forEach((g, i) => {
+    const col = i % 4, rw = Math.floor(i / 4);
+    const locked = !!tsave.locked[g.id];
+    const card = canvasMesh(.5, .42, 400, 336, (c, W, H, self) => {
+      rrect(c, 6, 6, W-12, H-12, 36, locked ? '#ffebee' : '#e8f5e9', self.hover ? '#ffb300' : (locked ? '#e53935' : '#43a047'), self.hover ? 14 : 8);
+      c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillStyle = '#000';
+      c.font = '110px system-ui, Arial'; c.fillText(g.icon, W/2, 100);
+      c.fillStyle = '#223344'; fitText(c, g.name, W - 40, 44); c.fillText(g.name, W/2, 195);
+      c.fillStyle = locked ? '#c62828' : '#2e7d32'; c.font = '800 48px system-ui, Arial';
+      c.fillText(locked ? '🔒 gesperrt' : '✔ frei', W/2, 265);
+    });
+    card.mesh.position.set((col - 1.5) * .56, 1.78 - rw * .48, -1.7);
+    card.mesh.userData.onHit = () => {
+      if (locked) delete tsave.locked[g.id]; else tsave.locked[g.id] = true;
+      writeTarget(); sndOk(); go(() => createAdminScreen(tid));
+    };
+    card.mesh.userData.setHover = on => { if (card.hover !== on) { card.hover = on; card.redraw(); } };
+    A.add(card.mesh); A.addInter(card.mesh);
+  });
+
+  const back = makeButton('Zurück', .6, .22, '#546e7a', () => go(createHubScreen));
+  back.mesh.position.set(0, .95, -1.7); A.add(back.mesh); A.addInter(back.mesh);
+  return A;
+}
+
+/* ======================================================================
    Hub (Spielauswahl)
    ====================================================================== */
 function createHubScreen() {
   const H = makeScreen();
   const waiting = GAMES.filter(isWaiting);
-  const nextLocked = GAMES.find(g => !isUnlocked(g) && !isWaiting(g));
+  const nextLocked = GAMES.find(g => !isUnlocked(g) && !isWaiting(g) && !isLocked(g));
 
   const title = canvasMesh(1.8, .7, 1024, 400, (c, W, Hh) => {
     rrect(c, 8, 8, W-16, Hh-16, 48, 'rgba(255,255,255,0.93)');
@@ -632,6 +687,11 @@ function createHubScreen() {
   const sw = makeButton('Spieler wechseln', .8, .24, '#546e7a', () => go(createUserScreen));
   sw.mesh.position.set(0, .75, -1.7); sw.mesh.rotation.x = -.35;
   H.add(sw.mesh); H.addInter(sw.mesh);
+  if (currentUser.all) {
+    sw.mesh.position.x = -.5;
+    const adm = makeButton('🔧 Spiele sperren', .8, .24, '#8e24aa', () => go(() => createAdminScreen()));
+    adm.mesh.position.set(.5, .75, -1.7); adm.mesh.rotation.x = -.35; H.add(adm.mesh); H.addInter(adm.mesh);
+  }
 
   const R = 2.7, SPAN = 15.5 * Math.PI / 180;
   GAMES.forEach((g, i) => {
@@ -649,6 +709,7 @@ function createHubScreen() {
       wrapText(c, g.desc, W/2, 420, W - 80, 46);
       c.font = '800 46px system-ui, Arial';
       if (unlocked) { c.fillStyle = '#2e7d32'; c.fillText(save.best[g.id] ? `🏆 ${save.best[g.id]}` : 'Los geht’s!', W/2, 620); }
+      else if (isLocked(g)) { c.fillStyle = '#c62828'; c.fillText('🔒 von Papa gesperrt', W/2, 620); }
       else if (wait) { c.fillStyle = '#ef6c00'; c.fillText(`⏳ Frei ${freeLabel(g)}`, W/2, 620); }
       else { c.fillStyle = '#c62828'; c.fillText(`🔒 ab ${g.unlock} Punkten`, W/2, 620); }
       if (isNew) {
@@ -1952,7 +2013,7 @@ addEventListener('resize', () => {
 });
 
 // Test-/Debug-Zugriff
-window.__sammlung = { get screen() { return screen; }, GAMES, get save() { return save; }, USERS, go, createGameScreen, createHubScreen, createUserScreen, createPinScreen, gameMaze, gameIrrgarten, camera, renderer, controllers, selectUser(id) { currentUser = USERS.find(u => u.id === id); save = readSave(id); migrateSave(); } };
+window.__sammlung = { get screen() { return screen; }, GAMES, get save() { return save; }, USERS, go, createGameScreen, createHubScreen, createUserScreen, createPinScreen, createAdminScreen, gameMaze, gameIrrgarten, camera, renderer, controllers, selectUser(id) { currentUser = USERS.find(u => u.id === id); save = readSave(id); migrateSave(); } };
 </script>
 </body>
 </html>
